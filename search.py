@@ -1,148 +1,132 @@
-# provider_search.py
-
-import requests
 from typing import List, Dict, Any, Optional
 from config import settings
-from requests.adapters import HTTPAdapter, Retry
 import datetime
+import requests
+from requests.adapters import HTTPAdapter, Retry
 
+# (you already have _session_with_retries and _format_as_of_date and normalize_provider_detail)
 
-# ---------------------------
-# Utility: create session with retries
-# ---------------------------
-def _session_with_retries() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=0.5,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "POST"]),
-        raise_on_status=False
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
-
-def _format_as_of_date(as_of_date: Optional[str]) -> str:
-    """
-    Ensure asOfDate is YYYYMMDD.
-    - If as_of_date is already provided (string), asume its valid and return as-is
-    - If None, use today's date in YYYYMMDD.
-    """
-    if as_of_date:
-        return as_of_date.strip()
-    return datetime.date.today().strftime("%Y%m%d")
-# ---------------------------
-# Normalize provider response
-# ---------------------------
-def normalize_provider_detail(detail: dict) -> dict:
-    info = detail.get("providerInfo") or {}
-    contact = detail.get("providerContact") or {}
-
-    return {
-        "providerId": info.get("providerId"),
-        "name": info.get("providerName") or info.get("providerFullName"),
-        "address1": contact.get("addressLine1"),
-        "address2": contact.get("addressLine2"),
-        "city": contact.get("city"),
-        "state": contact.get("state"),
-        "zip": contact.get("zip"),
-        "county": contact.get("county"),
-        "phone": contact.get("phone"),
-        "fax": contact.get("fax"),
-        "networkStatus": info.get("networkStatus"),
-        "isAcceptingNewMembers": info.get("isAcceptingNewMembers"),
-        "pcpAssnInd": info.get("pcpAssnInd"),
-        "distance_mi": info.get("distanceInMiles"),
-    }
-
-
-# ---------------------------
-# MAIN FUNCTION
-# ---------------------------
-def provider_search_by_id(
-    id: str,
+def provider_search_by_name(
+    last_name: str,
     group_id: str,
     subscriber_id: str,
+    member_id: str,
+    first_name: Optional[str] = None,
+    provider_name: Optional[str] = None,
+    city: Optional[str] = None,
+    state: Optional[str] = None,
+    startingLocationZip: Optional[str] = None,
+    memberOverrideClass: Optional[str] = None,
+    memberOverridePlan: Optional[str] = None,
+    startingLocationAddr: Optional[str] = None,
+    limit: Optional[str] = None,
+    offset: Optional[str] = None,
     asOfDate: Optional[str] = None,
-    limit: Optional[str] = settings.limit,
-    offset: Optional[str] = settings.offset,
-    onlyPcps: Optional[str] = settings.onlyPcps,
-    startingLocationZip: Optional[str] = settings.startingLocationZip or "",
-    startingLocationAddr1: Optional[str] = settings.startingLocationAddr1 or "",
-    memberId: Optional[str] = settings.memberId,
-    memberOverrideClass: Optional[str] = settings.memberOverrideClass,
-    memberOverridePlan: Optional[str] = settings.memberOverridePlan,
-    generalDescription: Optional[str] = settings.generalDescription,
 ) -> List[Dict[str, Any]]:
     """
-    Calls the Provider Search By ID REST API endpoint,
-    extracts providerDetails → providerInfo & providerContact,
-    normalizes them, and returns a list of provider records.
+    Call Provider Search By Name REST API.
 
-    Returns:
-        List[Dict]: Normalized provider records.
+    Request payload includes (as per your spec):
+      - lastName (mandatory)
+      - groupId (mandatory)
+      - subscriberId (mandatory)
+      - memberId
+      - firstName
+      - providerName
+      - city
+      - state
+      - startingLocationZip (optional 5-digit; used also for ZIP filtering)
+      - memberOverrideClass
+      - memberOverridePlan
+      - startingLocationAddr
+      - limit
+      - offset
+      - asOfDate (mandatory for API; if None we default to today's date in YYYYMMDD)
     """
 
-    url = settings.By_Id_URL
-    print("URL : ", url)
+    # Fill defaults from settings if not provided
+    if limit is None:
+        limit = getattr(settings, "limit", None)
+    if offset is None:
+        offset = getattr(settings, "offset", None)
+    if memberOverrideClass is None:
+        memberOverrideClass = getattr(settings, "memberOverrideClass", None)
+    if memberOverridePlan is None:
+        memberOverridePlan = getattr(settings, "memberOverridePlan", None)
+    if startingLocationAddr is None:
+        # if your settings has a specific addr default, use that
+        startingLocationAddr = getattr(settings, "startingLocationAddr", "") or ""
+    if startingLocationZip is None:
+        startingLocationZip = getattr(settings, "startingLocationZip", "") or ""
+
+    # asOfDate – if not provided, use today's date in YYYYMMDD
+    as_of_date = _format_as_of_date(asOfDate)
+
+    url = getattr(settings, "By_Name_URL")
     timeout = 30
     verify = settings.VERIFY_SSL_REST
 
-    as_of_date = _format_as_of_date(asOfDate)
-    print("asOfDate : ", as_of_date)
+    api_key = getattr(settings, "X_API_KEY", "")
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": api_key,
+    }
 
     payload: Dict[str, Any] = {
-        "id": id,
+        "lastName": last_name,
+        "groupId": group_id,
+        "subscriberId": subscriber_id,
+        "memberId": member_id,
+        "firstName": first_name,
+        "providerName": provider_name,
+        "city": city,
+        "state": state,
         "startingLocationZip": startingLocationZip,
-        "startingLocationAddr1": startingLocationAddr1,
-        "memberId": memberId,
         "memberOverrideClass": memberOverrideClass,
         "memberOverridePlan": memberOverridePlan,
-        "generalDescription": generalDescription,
+        "startingLocationAddr": startingLocationAddr,
         "limit": limit,
         "offset": offset,
         "asOfDate": as_of_date,
-        "onlyPcps": onlyPcps,
-        "groupId": group_id,
-        "subscriberId": subscriber_id,
     }
-    print(payload)
+
+    # Drop None values to avoid sending nulls if the API is strict
+    payload = {k: v for k, v in payload.items() if v is not None}
+
     session = _session_with_retries()
+    print("Name search payload:", payload)
 
     try:
-        resp = session.post(url, json=payload, timeout=timeout, verify=verify)
+        resp = session.post(url, headers=headers, json=payload, timeout=timeout, verify=verify)
         resp.raise_for_status()
         data = resp.json()
-        print(data)
-
+        print("Name search raw response:", data)
     except Exception as ex:
-        raise RuntimeError(f"Provider search by ID failed: {ex}") from ex
+        raise RuntimeError(f"Provider search by Name/City/State failed: {ex}") from ex
 
-    # ---------------------------
-    # VALIDATE RESPONSE STRUCTURE
-    # ---------------------------
     raw_details = data.get("providerDetails")
-
     if raw_details is None:
-        # API might return single object, list, or empty
         return []
 
-    # Ensure it's a list
     if isinstance(raw_details, dict):
         raw_details = [raw_details]
 
-    # ---------------------------
-    # NORMALIZE EACH ENTRY
-    # ---------------------------
     normalized: List[Dict[str, Any]] = []
-
     for detail in raw_details:
         try:
             normalized.append(normalize_provider_detail(detail))
         except Exception:
-            # skip malformed entries but do not break function
             continue
+
+    # ZIP filter: if user provided a 5-digit ZIP, only keep providers whose
+    # first 5 digits of the returned zip match.
+    if startingLocationZip:
+        user_zip5 = str(startingLocationZip)[:5]
+        filtered: List[Dict[str, Any]] = []
+        for p in normalized:
+            pzip = str(p.get("zip") or "")
+            if pzip[:5] == user_zip5:
+                filtered.append(p)
+        normalized = filtered
 
     return normalized
