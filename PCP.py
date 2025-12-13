@@ -1,222 +1,186 @@
-    specialist_service_specialty: Optional[str]
-    specialist_raw_filter_input: Optional[str]
-####################################################33
-
-def llm_parse_specialist_filters(user_text: str) -> Dict[str, Any]:
+def node_specialist_provider_address(state: PCPState) -> PCPState:
     """
-    Extract specialist search filters from text.
-
-    Returns ONLY JSON:
-    {
-      "use_defaults": boolean,
-      "language": string | null,
-      "gender": "M" | "F" | null,
-      "zip": string | null,
-      "as_of_date": string | null,        # YYYYMMDD
-      "radius_in_miles": number | null
-    }
+    After specialist provider grid is shown, user selects a provider id and asks for address.
+    Return address JSON in AIResponse, and mark conversation as completed (inquiry only).
     """
-    system = (
-        "You are an AI that extracts Specialist provider-search filters from text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{\n"
-        '  "use_defaults": boolean,\n'
-        '  "language": string | null,\n'
-        '  "gender": "M" | "F" | null,\n'
-        '  "zip": string | null,\n'
-        '  "as_of_date": string | null,\n'
-        '  "radius_in_miles": number | null\n'
-        "}\n"
-        "Rules:\n"
-        "- If the user says 'Please proceed with the default values' (or same meaning), set use_defaults=true.\n"
-        "- Otherwise use_defaults=false.\n"
-        "- zip must be exactly 5 digits if present.\n"
-        "- gender must be M or F when user implies male/female; if unclear use null.\n"
-        "- If user provides a date in ANY format, convert to YYYYMMDD.\n"
-        "- Only set radius_in_miles if the user explicitly wants to change the default distance.\n"
-        "Return JSON only."
-    )
+    logger.debug("node_specialist_provider_address")
 
-    raw = call_horizon(system, user_text).strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        idx = raw.find("{")
-        if idx != -1:
-            raw = raw[idx:]
-
-    try:
-        data = json.loads(raw)
-        return {
-            "use_defaults": bool(data.get("use_defaults", False)),
-            "language": data.get("language"),
-            "gender": data.get("gender"),
-            "zip": data.get("zip"),
-            "as_of_date": data.get("as_of_date"),
-            "radius_in_miles": data.get("radius_in_miles"),
-        }
-    except Exception:
-        logger.warning("Failed to parse Specialist filter JSON from LLM: %s", raw)
-        return {
-            "use_defaults": False,
-            "language": None,
-            "gender": None,
-            "zip": None,
-            "as_of_date": None,
-            "radius_in_miles": None,
-        }
-
-
-###############################################3
-
-
-def node_run_specialist_generic_search(state: PCPState) -> PCPState:
-    """
-    Specialist flow:
-    - Use stored specialist_service_specialty
-    - Parse specialist_raw_filter_input (any combo)
-    - Apply defaults (distance from CSV for Specialist + today's YYYYMMDD if date missing)
-    - Call provider_generic_search(serviceSpecialty=...)
-    - Return provider grid JSON in AIResponse (AURA, 107), PromptTitle/Prompts empty
-    """
-    logger.debug("node_run_specialist_generic_search")
-
-    # If already have results, don't re-run
-    if state.get("providers_result"):
-        return state
-
-    group_id = (state.get("group_id") or "").strip()
-    subscriber_id = (state.get("subscriber_id") or "").strip()
-    specialty = (state.get("specialist_service_specialty") or "").strip()
-
-    if not group_id or not subscriber_id:
-        state["ai_response"] = "Member details are missing (groupId/subscriberId). Please start a new conversation."
-        state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 500
+    providers = state.get("providers_result") or []
+    if not providers:
+        state["ai_response"] = "No providers are available in the current result. Please start a new search."
         state["prompt_title"] = ""
         state["prompts"] = []
+        state["ai_response_code"] = 404
+        state["ai_response_type"] = "AURA"
         state["stage"] = "ERROR"
         return state
 
-    if not specialty:
-        state["ai_response"] = "Service specialty code is missing. Please enter the service specialty code."
-        state["ai_response_type"] = "AURA"
-        state["ai_response_code"] = 109
+    # We should already have the user's message in csr_query (resume value)
+    user_msg = (state.get("csr_query") or "").strip()
+    if not user_msg:
+        requested = interrupt({"prompt": "", "stage": "WAIT_SPECIALIST_PROVIDER_ACTION"})
+        state["csr_query"] = str(requested).strip()
+        user_msg = state["csr_query"]
+
+    # Use existing LLM helper to understand intent + provider id
+    decision = llm_decide_followup_action(user_msg, providers)
+    action = decision.get("action")
+    pid = decision.get("provider_id")
+
+    # Specialist flow supports ONLY address inquiry (not assignment)
+    if action != "address" or not pid:
+        state["ai_response"] = (
+            "Please provide a Provider ID and ask for its address (for example: 'address of 12345678')."
+        )
         state["prompt_title"] = ""
         state["prompts"] = []
-        state["stage"] = "ASK_SPECIALTY"
+        state["ai_response_code"] = 110
+        state["ai_response_type"] = "AURA"
+        state["stage"] = "SPECIALIST_NEED_ADDRESS_CLARIFICATION"
         return state
 
-    # Defaults
-    default_radius = get_default_radius_in_miles(group_id=group_id, practitioner_type="Specialist")
-    today_yyyymmdd = datetime.now().strftime("%Y%m%d")
+    # Find chosen provider from providers_result
+    chosen = None
+    for p in providers:
+        cand = (
+            p.get("providerId")
+            or p.get("provId")
+            or p.get("ProviderID")
+            or p.get("id")
+        )
+        if str(cand).strip() == str(pid).strip():
+            chosen = p
+            break
 
-    raw_text = (state.get("specialist_raw_filter_input") or "").strip()
-    parsed = llm_parse_specialist_filters(raw_text)
+    if not chosen:
+        state["ai_response"] = "I couldn't find that Provider ID in the current results. Please pick a Provider ID from the list."
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["ai_response_code"] = 110
+        state["ai_response_type"] = "AURA"
+        state["stage"] = "SPECIALIST_NEED_ADDRESS_CLARIFICATION"
+        return state
 
-    radius = int(default_radius)
-    provider_lang = ""
-    provider_sex = ""
-    zip_code = ""
-    as_of_date = today_yyyymmdd
+    prov_id = str(chosen.get("providerId") or pid or "").strip()
+    addr_payload = {
+        "providerAddress": [{
+            "ProviderID": prov_id,
+            "AddressType": chosen.get("addressType"),
+            "AddressLine1": chosen.get("address1") or chosen.get("addressLine1"),
+            "AddressLine2": chosen.get("address2") or chosen.get("addressLine2"),
+            "City": chosen.get("city"),
+            "State": chosen.get("state"),
+            "Zip": chosen.get("zip") or chosen.get("zipCode"),
+            "Country": chosen.get("country") or chosen.get("county"),
+            "Phone": chosen.get("phone"),
+            "Fax": chosen.get("fax"),
+            "EffectiveDate": chosen.get("effectiveDate"),
+            "TerminationDate": chosen.get("terminationDate"),
+        }]
+    }
 
-    if parsed.get("use_defaults"):
-        # keep defaults only
-        pass
-    else:
-        # language -> providerLanguage
-        provider_lang = map_language_to_code(parsed.get("language"))
-
-        # gender -> providerSex (M/F only)
-        g = parsed.get("gender")
-        if g in ("M", "F"):
-            provider_sex = g
-
-        # zip -> startingLocationZip
-        z = parsed.get("zip")
-        if z and str(z).isdigit() and len(str(z)) == 5:
-            zip_code = str(z)
-
-        # date -> asOfDate (YYYYMMDD)
-        d = parsed.get("as_of_date")
-        if isinstance(d, str) and d.strip():
-            as_of_date = d.strip()
-
-        # radius override
-        r = parsed.get("radius_in_miles")
-        if isinstance(r, (int, float)) and r > 0:
-            radius = int(r)
-
-    # ✅ IMPORTANT: provider_generic_search must accept these named params
-    providers = provider_generic_search(
-        group_id=group_id,
-        subscriber_id=subscriber_id,
-        radius_in_miles=radius,
-        startingLocationZip=zip_code,
-        asOfDate=as_of_date,
-        providerLanguage=provider_lang,
-        providerSex=provider_sex,
-        serviceSpecialty=specialty,
-    )
-
-    # Build grid JSON (same shape)
-    grid_list: List[Dict[str, Any]] = []
-    for p in (providers or []):
-        prov_id = p.get("providerId") or ""
-        name_val = p.get("name") or ""
-        addr = _format_address_from_provider(p)
-
-        raw_network = p.get("networkStatus") or ""
-        raw_up = str(raw_network).upper()
-        if raw_up in ("IN", "IN NETWORK"):
-            net_str = "In Network"
-        elif raw_up in ("OUT", "OUT NETWORK"):
-            net_str = "Out Network"
-        else:
-            net_str = str(raw_network) if raw_network else ""
-
-        grid_list.append({
-            "ProviderID": str(prov_id),
-            "Name": str(name_val),
-            "Address": addr,
-            "Network": net_str,
-            "IsAcceptingNewMembers": p.get("isAcceptingNewMembers"),
-            "PCPAssnInd": p.get("pcpAssnInd") or p.get("PCPAssnInd"),
-            "DistanceInMiles": p.get("distance_mi") or p.get("distanceInMiles"),
-        })
-
-    response_payload = {"providers": grid_list}
-
-    state["providers_result"] = providers
-    state["ai_response"] = json.dumps(response_payload, default=str, separators=(",", ":"))
+    # Final inquiry response (completed)
+    state["ai_response"] = json.dumps(addr_payload, default=str, separators=(",", ":"))
     state["ai_response_type"] = "AURA"
-    state["ai_response_code"] = 107
-    state["prompt_title"] = ""
-    state["prompts"] = []
-    state["stage"] = "SHOW_SPECIALIST_PROVIDER_LIST"
+    state["ai_response_code"] = 110
+    state["prompt_title"] = "Do you need further assistance?"
+    state["prompts"] = ["Yes", "No"]
+    state["stage"] = "COMPLETED"
 
-    requested = interrupt({"prompt": state["ai_response"], "stage": state["stage"]})
-    state["csr_query"] = str(requested)
+    requested = interrupt({
+        "prompt": state["ai_response"],
+        "stage": "SPECIALIST_COMPLETED",
+        "prompt_title": state["prompt_title"],
+        "prompts": state["prompts"],
+        "ai_response_code": state["ai_response_code"],
+        "ai_response_type": state["ai_response_type"],
+    })
+
+    # store next yes/no answer for routing
+    state["csr_query"] = str(requested).strip()
     return state
+=====================================
+def node_specialist_post_completion(state: PCPState) -> PCPState:
+    """
+    After specialist address is shown with Yes/No prompts, route:
+    - Yes -> reset and go back to menu
+    - No  -> closing message + END
+    """
+    logger.debug("node_specialist_post_completion")
 
-####################################################################################################33
+    txt = (state.get("csr_query") or "").strip().lower()
 
-builder.add_node("run_specialist_generic_search", node_run_specialist_generic_search)
+    # Let Horizon interpret yes/no semantically (no hardcoded matching only)
+    sys = (
+        "You classify whether the user response means YES or NO.\n"
+        "Return ONLY JSON: {\"answer\":\"yes\"|\"no\"|\"unknown\"}\n"
+    )
+    raw = call_horizon(sys, txt).strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        i = raw.find("{")
+        if i != -1:
+            raw = raw[i:]
+    ans = "unknown"
+    try:
+        ans = (json.loads(raw).get("answer") or "unknown").lower()
+    except Exception:
+        ans = "unknown"
 
-builder.add_edge("specialist_ask_filters", "run_specialist_generic_search")
+    if ans == "no":
+        state["ai_response"] = "We're closing your request-feel free to return if you need anything else."
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 101
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "CLOSED"
+        return state
 
-elif stage_from_node == "SHOW_SPECIALIST_PROVIDER_LIST":
+    # YES or unknown -> send to menu (same behavior as start)
+    # reset specialist-specific fields (keep member details/thread)
+    state["providers_result"] = None
+    state["specialist_service_specialty"] = None
+    state["specialist_raw_filter_input"] = None
+    state["csr_query"] = ""   # menu will interrupt and refill
+    state["stage"] = "MENU"
+    return state
+==============================================
+builder.add_node("specialist_provider_address", node_specialist_provider_address)
+builder.add_node("specialist_post_completion", node_specialist_post_completion)
+=========================================================
+builder.add_edge("run_specialist_generic_search", "specialist_provider_address")
+builder.add_edge("specialist_provider_address", "specialist_post_completion")
+================================================================
+def route_after_specialist_completion(state: PCPState) -> str:
+    if state.get("stage") == "CLOSED":
+        return "end"
+    return "menu"
+============================
+builder.add_conditional_edges(
+    "specialist_post_completion",
+    path=route_after_specialist_completion,
+    path_map={
+        "menu": "start",
+        "end": END,
+    },
+)
+==========================================
+elif stage_from_node == "SPECIALIST_COMPLETED":
+    # The interrupt prompt is the address JSON.
     ai_resp_text = prompt or last_state.get("ai_response", "")
+    ptitle = interrupt_payload.get("prompt_title") or last_state.get("prompt_title") or "Do you need further assistance?"
+    pr = interrupt_payload.get("prompts") or last_state.get("prompts") or ["Yes", "No"]
+
     return JSONResponse(
         base_response(
             thread_id=req.thread_id,
-            stage="SHOW_SPECIALIST_PROVIDER_LIST",
+            stage="COMPLETED",                 # ✅ as you requested
             ai_response=ai_resp_text,
             csr_query=req.message or "",
-            prompts=[],
-            prompt_title="",
-            ai_response_code=107,
+            prompts=pr,
+            prompt_title=ptitle,
+            ai_response_code=110,
             ai_response_type="AURA",
         )
     )
-
-####################################################################################################
+====================================================
