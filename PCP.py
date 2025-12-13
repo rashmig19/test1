@@ -1,148 +1,149 @@
-    # Specialist flow
-    flow: Optional[str]  # "pcp" | "specialist"
-    specialist_service_specialty: Optional[str]  # e.g. "S204"
+    specialist_raw_filter_input: Optional[str]
 
-###############################################################33
+###########################################################3
 
-SPECIALIST_SERVICE_QUESTION = getattr(
+SPECIALIST_FILTERS_TEMPLATE = getattr(
     settings,
-    "SPECIALIST_SERVICE_QUESTION",
-    "<p>What services are you looking for at this location?</p>"
+    "SPECIALIST_FILTERS_TEMPLATE",
+    "<p><b>Ask the below questions:</b></p>\n"
+    "<ul>\n"
+    "<li>May I know any other preferred Language, if not English and Gender (Male/Female/Either)?</li>\n"
+    "<li>The default distance is <<default_distance>> miles, please confirm if any changes needed.</li>\n"
+    "<li>Search would be performed based on member's home address. If you would like to search provider at different location,please provide with zip code and address line 1.</li>\n"
+    "<li>Search will be performed with today’s date unless a different date is provided (MM-DD-YYYY).</li>\n"
+    "</ul>"
 )
 
 
-###############################################################
+#############################################################
 
-def llm_route_menu_intent(user_text: str) -> str:
+def node_specialist_ask_filters(state: PCPState) -> PCPState:
     """
-    Returns: "assign_pcp" | "specialist" | "unsupported"
-    Uses Horizon LLM so we can handle spelling mistakes and semantic variants.
+    After specialist service specialty code is captured:
+    - compute default distance from CSV using PractitionerType="Specialist" and group_id
+    - ask Horizon to output the exact HTML template with default_distance replaced
+    - AIResponseType=Dialog, AIResponseCode=103, PromptTitle/Prompts empty
+    - interrupt to capture user filter inputs for next step (later)
     """
-    system = (
-        "You are an intent classifier for a health plan CSR assistant.\n"
-        "Classify the user's menu choice into one of:\n"
-        '- "assign_pcp"\n'
-        '- "specialist"\n'
-        '- "unsupported"\n'
-        "Consider spelling mistakes and semantic variants.\n"
-        "Return ONLY JSON like: {\"intent\":\"assign_pcp\"}\n"
-    )
-    raw = call_horizon(system, user_text).strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        idx = raw.find("{")
-        if idx != -1:
-            raw = raw[idx:]
+    logger.debug("node_specialist_ask_filters")
+
+    # Ensure we have member market identifiers (group_id/subscriber_id) for CSV + later API calls
+    member_id = (state.get("member_id") or "").strip()
+    if not member_id:
+        state["ai_response"] = "Member information is missing. Please start a new conversation."
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 500
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "ERROR"
+        return state
+
+    if not (state.get("group_id") and state.get("subscriber_id") and state.get("meme_ck") and state.get("grgr_ck")):
+        try:
+            member_response = member_search(dob="", mbrId=member_id, firstNm="", lastNm="")
+            if isinstance(member_response, list):
+                if not member_response:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found.")
+                member_payload = member_response[0]
+            else:
+                member_payload = member_response
+
+            state["grgr_ck"] = str(member_payload.get("grgrCk") or member_payload.get("sbsbCk") or "").strip()
+            state["meme_ck"] = str(member_payload.get("memeCk") or "").strip()
+            state["group_id"] = str(member_payload.get("grpId") or "").strip()
+            state["subscriber_id"] = str(member_payload.get("subscriberId") or "").strip()
+        except Exception as ex:
+            logger.exception("member_search failed in specialist flow: %s", ex)
+            state["ai_response"] = "Unable to fetch member details right now. Please try again later."
+            state["ai_response_type"] = "AURA"
+            state["ai_response_code"] = 500
+            state["prompt_title"] = ""
+            state["prompts"] = []
+            state["stage"] = "ERROR"
+            return state
+
+    group_id = (state.get("group_id") or "").strip()
+    if not group_id:
+        state["ai_response"] = "Member group information is missing. Please start a new conversation."
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 500
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "ERROR"
+        return state
+
+    # Default distance from CSV for Specialist
     try:
-        data = json.loads(raw)
-        intent = str(data.get("intent") or "").strip()
-        if intent in ("assign_pcp", "specialist", "unsupported"):
-            return intent
-        return "unsupported"
-    except Exception:
-        logger.warning("Failed to parse menu intent JSON from LLM: %s", raw)
-        return "unsupported"
+        default_distance = get_default_radius_in_miles(group_id=group_id, practitioner_type="Specialist")
+    except Exception as ex:
+        logger.exception("Default distance lookup failed: %s", ex)
+        state["ai_response"] = "Unable to determine the default distance right now. Please try again later."
+        state["ai_response_type"] = "AURA"
+        state["ai_response_code"] = 500
+        state["prompt_title"] = ""
+        state["prompts"] = []
+        state["stage"] = "ERROR"
+        return state
 
+    expected_html = SPECIALIST_FILTERS_TEMPLATE.replace("<<default_distance>>", str(default_distance))
 
-#######################################################################
-
-def node_specialist_ask_service(state: PCPState) -> PCPState:
-    """
-    Specialist flow step 1:
-    Ask exact question (AIResponse must be EXACT HTML),
-    then interrupt and store the service specialty code.
-    """
-    logger.debug("node_specialist_ask_service")
-
-    # mark flow
-    state["flow"] = "specialist"
-
-    # Ask Horizon to output EXACT text, then enforce exact output safely
+    # Ask Horizon to produce EXACT HTML (then enforce exactness to meet UI contract)
     system = (
-        "You are a CSR assistant. You MUST return EXACTLY the following text and nothing else:\n"
-        f"{SPECIALIST_SERVICE_QUESTION}"
+        "You are a CSR assistant.\n"
+        "Return EXACTLY the following HTML (no extra spaces, no explanation, no markdown fences):\n"
+        f"{expected_html}"
     )
-    ai_msg = call_horizon(system, "Return the exact text now.").strip()
-
-    # Enforce exactness (requirement says exact string)
-    if ai_msg != SPECIALIST_SERVICE_QUESTION:
-        ai_msg = SPECIALIST_SERVICE_QUESTION
+    ai_msg = call_horizon(system, "Return the exact HTML now.").strip()
+    if ai_msg != expected_html:
+        ai_msg = expected_html  # enforce contract
 
     state["ai_response"] = ai_msg
-    state["ai_response_type"] = "AURA"
-    state["ai_response_code"] = 109
+    state["ai_response_type"] = "Dialog"
+    state["ai_response_code"] = 103
     state["prompt_title"] = ""
     state["prompts"] = []
-    state["stage"] = "ASK_SPECIALIST_SERVICE"
+    state["stage"] = "ASK_SPECIALIST_FILTERS"
 
     requested = interrupt({
         "prompt": ai_msg,
         "stage": state["stage"],
     })
 
-    # On resume: store the specialty code for later steps
-    state["specialist_service_specialty"] = str(requested).strip()
-    state["csr_query"] = ""  # keep clean
-    state["stage"] = "SPECIALIST_SERVICE_CAPTURED"
-
-    # Nothing else yet (next steps will be added later)
-    state["ai_response"] = ""
-    state["prompt_title"] = ""
-    state["prompts"] = []
-    state["ai_response_code"] = 101
-    state["ai_response_type"] = "AURA"
+    # store the filter text for next step (generic search later)
+    state["specialist_raw_filter_input"] = str(requested).strip()
+    state["csr_query"] = ""
+    state["stage"] = "SPECIALIST_FILTERS_CAPTURED"
     return state
 
 
-###############################################################
-def route_from_menu(state: PCPState) -> str:
-    text = (state.get("csr_query") or "").strip()
-    if not text:
-        return "unsupported"
-    return llm_route_menu_intent(text)
+##########################################################
 
+    state["specialist_service_specialty"] = str(requested).strip()
+    state["csr_query"] = ""
+    state["stage"] = "SPECIALIST_SERVICE_CAPTURED"
+    return state
 
-###############################################################
+####################################################################333
 
-builder.add_node("specialist_ask_service", node_specialist_ask_service)
+builder.add_node("specialist_ask_filters", node_specialist_ask_filters)
 
+builder.add_edge("specialist_ask_service", "specialist_ask_filters")
+builder.add_edge("specialist_ask_filters", END)
 
-builder.add_conditional_edges(
-    "start",
-    path=route_from_menu,
-    path_map={
-        "assign_pcp": "assign_pcp_ask_termination",
-        "specialist": "specialist_ask_service",
-        "unsupported": END,
-    },
-)
+###########################################################################3
 
-
-###############################################3
-
-builder.add_edge("specialist_ask_service", END)
-
-
-##############33
-            elif stage_from_node == "ASK_SPECIALIST_SERVICE":
-                ai_resp_text = prompt or last_state.get("ai_response", "") or SPECIALIST_SERVICE_QUESTION
-                # ensure exact
-                if ai_resp_text != SPECIALIST_SERVICE_QUESTION:
-                    ai_resp_text = SPECIALIST_SERVICE_QUESTION
-
+            elif stage_from_node == "ASK_SPECIALIST_FILTERS":
+                ai_resp_text = prompt or last_state.get("ai_response", "")
                 return JSONResponse(
                     base_response(
                         thread_id=req.thread_id,
-                        stage="ASK_SPECIALIST_SERVICE",
+                        stage="ASK_SPECIALIST_FILTERS",
                         ai_response=ai_resp_text,
                         csr_query=req.message or "",
                         prompts=[],
                         prompt_title="",
-                        ai_response_code=109,
-                        ai_response_type="AURA",
+                        ai_response_code=103,
+                        ai_response_type="Dialog",
                     )
                 )
-
-
-##################################################
 
