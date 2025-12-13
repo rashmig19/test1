@@ -12,8 +12,8 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Command, interrupt
 from langgraph.checkpoint.memory import InMemorySaver
 
-from datetime import datetime, timezone, timedelta
-
+from datetime import datetime, timedelta, date
+from time import perf_counter, sleep 
 import requests
 from config import settings
 from requests.adapters import HTTPAdapter, Retry
@@ -66,12 +66,26 @@ _member_token_cache: Dict[str, Any] = {
     "expires_at": 0.0,   # epoch seconds
 }
 
-def mmddyyyy(dt: datetime) -> str:
-    return dt.strftime("%m%d%Y")
+# def mmddyyyy(d: str) -> str:
+#     return mmddyyyy_slash(d)
+#     # return datetime.strptime(d, "%Y-%m-%d").strftime("%m/%d/%Y")
 
-def mmddyyyy_slash(dt: datetime) -> str:
-    return dt.strftime("%m/%d/%Y")
 
+# def mmddyyyy_slash(d: date) -> str:
+#     return d.strftime("%m/%d/%Y")
+
+def format_date_mmddyyyy(value):
+    # Case 1 : already a datetime or date object
+    if isinstance(value, (datetime, date)):
+        return value.strftime("%m/%d/%Y")
+    # Case 2 : string in yyyy-mm-dd
+    elif isinstance(value, str):
+        return datetime.strptime(value, "%Y-%m-%d").strftime("%m/%d/%Y")
+    
+    #optional: unknown type
+    raise ValueError(f"Unsupported data type:{type(value)}")
+
+    
 def _session_with_retries() -> requests.Session:
     """Requests session with basic retry policy suitable for gateways."""
     session = requests.Session()
@@ -237,7 +251,7 @@ class PCPState(TypedDict, total=False):
     prompt_title: Optional[str]
 
     # Track follow-up decision for loop routing 
-    last_folloup_action: Optional[str]
+    last_followup_action: Optional[str]
 
     # Remember the very first free-form text if user typed "Assign ...." at menu step
     initial_assign_text: Optional[str]
@@ -310,16 +324,16 @@ def llm_parse_zip_and_date(user_text: str) -> Dict[str, Any]:
     }
     """
     system = (
-        "You are an AI that extracts ZIP code and an as-of date from a member's free-text provider search request.\n"
-        "Return ONLY JSON with this schema:\n"
-        "{\n"
-        '  "zip": string | null,\n'
-        '  "as_of_date": string | null\n'
-        "}\n"
-        "Rules:\n"
-        "- zip must be exactly 5 numeric digits if present.\n"
+        "You are an AI that extracts ZIP code and an as-of date from a member's free-text provider search request.<br>"
+        "Return ONLY JSON with this schema:<br>"
+        "{<br>"
+        '  "zip": string | null,<br>'
+        '  "as_of_date": string | null<br>'
+        "}<br>"
+        "Rules:<br>"
+        "- zip must be exactly 5 numeric digits if present.<br>"
         "- as_of_date must be in YYYYMMDD format if present. If the user mentions a date in another format, "
-        "  convert it to YYYYMMDD. If no date is mentioned, use null.\n"
+        "  convert it to YYYYMMDD. If no date is mentioned, use null.<br>"
     )
     raw = call_horizon(system, user_text)
     raw = raw.strip()
@@ -342,21 +356,21 @@ def llm_parse_zip_and_date(user_text: str) -> Dict[str, Any]:
     
 def llm_parse_provider_input(user_text: str) -> Dict[str, Any]:
     system = (
-        "You are an AI that extracts provider search parameters from free text.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{\n"
-        '  "search_type": "id" | "name_city_state" | "zip_only",\n'
-        '  "provider_id": string | null,\n'
-        '  "zip": string | null,\n'
-        '  "name": string | null,\n'
-        '  "city": string | null,\n'
-        '  "state": string | null\n'
-        "}\n"
-        "Rules:\n"
-        "- If the input is ONLY an 8-digit number, it is a provider_id and search_type must be 'id'.\n"
-        "- If the input is ONLY a 5-digit number, it is a ZIP code and search_type must be 'zip_only'.\n"
-        "- If the user provides a provider name and city/state (optionally with zip), use search_type='name_city_state'.\n"
-        "- zip must be exactly 5 digits if present.\n"
+        "You are an AI that extracts provider search parameters from free text.<br>"
+        "Return ONLY valid JSON with this schema:<br>"
+        "{<br>"
+        '  "search_type": "id" | "name_city_state" | "zip_only",<br>'
+        '  "provider_id": string | null,<br>'
+        '  "zip": string | null,<br>'
+        '  "name": string | null,<br>'
+        '  "city": string | null,<br>'
+        '  "state": string | null<br>'
+        "}<br>"
+        "Rules:<br>"
+        "- If the input is ONLY an 8-digit number, it is a provider_id and search_type must be 'id'.<br>"
+        "- If the input is ONLY a 5-digit number, it is a ZIP code and search_type must be 'zip_only'.<br>"
+        "- If the user provides a provider name and city/state (optionally with zip), use search_type='name_city_state'.<br>"
+        "- zip must be exactly 5 digits if present.<br>"
         "Return JSON only (no markdown, no explanation)."
     )
     raw = call_horizon(system, user_text).strip()
@@ -383,12 +397,12 @@ def llm_parse_provider_input(user_text: str) -> Dict[str, Any]:
 def llm_parse_filter_input(user_text: str) -> Dict[str, Any]:
     system = (
         "You are an AI that extracts PCP search filters from free text. "
-        "Return ONLY JSON with this schema:\n"
-        "{\n"
-        '  "language": string | null,\n'
-        '  "radius_in_miles": number | null,\n'
-        '  "gender": "M" | "F" | null\n'
-        "}\n"
+        "Return ONLY JSON with this schema:<br>"
+        "{<br>"
+        '  "language": string | null,<br>'
+        '  "radius_in_miles": number | null,<br>'
+        '  "gender": "M" | "F" | null<br>'
+        "}<br>"
         "Pick gender from M/F when user mentions male/female, man/woman, etc."
     )
     raw = call_horizon(system, user_text)
@@ -418,17 +432,17 @@ def llm_decide_followup_action(user_text: str, providers: List[Dict[str, Any]]) 
       { "action": "provider_id_only"|"address"|"assign_pcp"|"other", "provider_id": string|null }
     """
     system = (
-        "You are an assistant that interprets a member's follow-up message after they received a provider list.\n"
-        "Return ONLY JSON with this schema:\n"
-        "{\n"
-        '  "action": "provider_id_only" | "address" | "assign_pcp" | "other",\n'
-        '  "provider_id": string | null\n'
-        "}\n"
-        "Rules:\n"
-        "- If the message contains ONLY a provider id (just digits, no other words), action must be 'provider_id_only'.\n"
-        "- If the user asks for address/location of a provider, action='address'.\n"
-        "- If the user asks to assign a provider as PCP, action='assign_pcp'.\n"
-        "- provider_id must match one of the providerId values from the list when possible.\n"
+        "You are an assistant that interprets a member's follow-up message after they received a provider list.<br>"
+        "Return ONLY JSON with this schema:<br>"
+        "{<br>"
+        '  "action": "provider_id_only" | "address" | "assign_pcp" | "other",<br>'
+        '  "provider_id": string | null<br>'
+        "}<br>"
+        "Rules:<br>"
+        "- If the message contains ONLY a provider id (just digits, no other words), action must be 'provider_id_only'.<br>"
+        "- If the user asks for address/location of a provider, action='address'.<br>"
+        "- If the user asks to assign a provider as PCP, action='assign_pcp'.<br>"
+        "- provider_id must match one of the providerId values from the list when possible.<br>"
         "Return JSON only."
     )
 
@@ -461,9 +475,9 @@ def node_start(state: PCPState) -> PCPState:
     """
     logger.debug("node_start")
     menu_text = (
-        "You can choose one of the following options:\n"
-        "1. Assign PCP\n"
-        "2. Search for specialist\n"
+        "You can choose one of the following options:<br>"
+        "1. Assign PCP<br>"
+        "2. Search for specialist<br>"
         "3. Need something else"
     )
     ai_msg = call_horizon(
@@ -488,7 +502,12 @@ def node_start(state: PCPState) -> PCPState:
     state["csr_query"] = str(requested)
 
     # Save original text; later we can reuse if it already includes provider id /name
-    state["initial_assign_text"] = state["csr_query"]
+    user_choice = (state["csr_query"] or "").strip()
+
+    if user_choice in DEFAULT_PROMPTS:
+        state["initial_assign_text"] = ""
+    else:
+        state["initial_assign_text"] = user_choice
     return state
 
 
@@ -499,26 +518,36 @@ def node_collect_termination_reason(state: PCPState) -> PCPState:
     if state.get("termination_reason"):
         return state
     
-    if not state.get("termination_reason"):
-        ai_msg = call_horizon(
-            "You are a CSR assistant.",
-            "Ask the member to provide a termination reason for their current PCP.",
-        )
-        state["ai_response"] = ai_msg
-        state["prompt_title"] = "Termination reason"
-        state["prompts"] = []
-        state["ai_response_code"] = 101
-        state["ai_response_type"] = "Dialog"
-        state["stage"] = "ASK_TERMINATION"
+    # Consume the termination reason that was captured in csr_query
+    reason = (state.get("csr_query") or "").strip()
+    if reason:
+        state["termination_reason"] = reason
+        state["csr_query"] = ""
+        return state
+    
+    # Safety fallback: if somehow we reached here without a resume value,
+    # route back to asking termination again by leaving termination_reason empty
+    return state
+    # if not state.get("termination_reason"):
+    #     ai_msg = call_horizon(
+    #         "You are a CSR assistant.",
+    #         "Ask the member to provide a termination reason for their current PCP.",
+    #     )
+    #     state["ai_response"] = ai_msg
+    #     state["prompt_title"] = "Termination reason"
+    #     state["prompts"] = []
+    #     state["ai_response_code"] = 101
+    #     state["ai_response_type"] = "Dialog"
+    #     state["stage"] = "ASK_TERMINATION"
 
-        requested = interrupt({
-            "prompt": ai_msg,
-            "stage": state["stage"],
-        })
-        state["termination_reason"] = str(requested)
-        return state
-    else:
-        return state
+    #     requested = interrupt({
+    #         "prompt": ai_msg,
+    #         "stage": state["stage"],
+    #     })
+    #     state["termination_reason"] = str(requested)
+    #     return state
+    # else:
+    #     return state
 
 def node_assign_pcp_ask_termination(state: PCPState) -> PCPState:
     """
@@ -577,6 +606,7 @@ def node_assign_pcp_ask_termination(state: PCPState) -> PCPState:
                 or curr_active.get("effDt")
             )
             state["active_eff_dt"] = str(eff).strip() if eff else None
+
         except Exception as ex:
             logger.exception("get_active_pcp failed: %s", ex)
             state["ai_response"] = "Unable to fetch your current PCP details right now. Please try again later."
@@ -623,6 +653,9 @@ def node_assign_pcp_ask_termination(state: PCPState) -> PCPState:
         # When resumed (next /chat call), we capture termination reason:
         # state["termination_reason"] = str(requested)
         # logger.debug("Termination reason captured from interrupt: %s", state["termination_reason"])
+        
+        # On resume, capture the termination reason into csr_query for the next node
+        state["csr_query"] = str(requested).strip()
         return state
 
     # ----------------------------------------------------------------------
@@ -633,17 +666,17 @@ def node_assign_pcp_ask_termination(state: PCPState) -> PCPState:
 
 def node_collect_knows_provider(state: PCPState) -> PCPState:
     logger.debug("node_collect_knows_provider")
-    # If the user already typed provider details in the very first free-form text,
-    # we can skip asking yes/no and go straight to search.
-    if state.get("knows_provider") is None and not state.get("raw_provider_input"):
-        candidate = (state.get("initial_assign_text") or "").strip()
-        if candidate:
-            parsed = llm_parse_provider_input(candidate)
-            if parsed.get("search_type") in ("id", "name_city_state", "zip_only"):
-                state["knows_provider"] = True
-                state["raw_provider_input"] = candidate
-                state["csr_query"] = candidate
-                return state
+    # # If the user already typed provider details in the very first free-form text,
+    # # we can skip asking yes/no and go straight to search.
+    # if state.get("knows_provider") is None and not state.get("raw_provider_input"):
+    #     candidate = (state.get("initial_assign_text") or "").strip()
+    #     if candidate:
+    #         parsed = llm_parse_provider_input(candidate)
+    #         if parsed.get("search_type") in ("id", "name_city_state", "zip_only"):
+    #             state["knows_provider"] = True
+    #             state["raw_provider_input"] = candidate
+    #             state["csr_query"] = candidate
+    #             return state
         
     if state.get("knows_provider") is None:
         system_prompt = (
@@ -683,12 +716,12 @@ def node_collect_provider_input(state: PCPState) -> PCPState:
         system_prompt = (
             "You are a CSR assistant helping a member choose a new PCP. "
             "You must produce a short dialog message that will be shown in the AIResponse field. "
-            "The message MUST:\n"
-            "- Start with a bold line: 'Ask the below questions:'\n"
-            "- Then show three bullet points (or dotted list items) in this exact order and wording:\n"
-            " 1) 'May I know the Provider ID? or Provider Name, City and State?'\n"
-            " 2) 'Search would be performed based on member's home address. If you would like to search provider at different location, please provide with zip code and address line 1.'\n"
-            " 3) 'Search will be performed with today's date unless a different date is provided (MM-DD-YYYY).'\n"
+            "The message MUST:<br>"
+            "- Start with a bold line: 'Ask the below questions:'  "
+            "- Then show three bullet points (or dotted list items) in this exact order and wording:  "
+            " 1) 'May I know the Provider ID? or Provider Name, City and State?'  "
+            " 2) 'Search would be performed based on member's home address. If you would like to search provider at different location, please provide with zip code and address line 1.'  "
+            " 3) 'Search will be performed with today's date unless a different date is provided (MM-DD-YYYY).'  "
             "Use simple markdown-style formatting: bold for the first line, and each question on its own line starting with a bullet or a dot. "
             "Return ONLY the formatted text, no explanations."
         )
@@ -975,14 +1008,14 @@ def node_run_provider_search(state: PCPState) -> PCPState:
         else:
             pid = parsed.get("provider_id") or ""
             state["provider_id"] = pid
-            # print("date : ", state.get("asOfDate", ""))
+            print("date : ", state.get("asOfDate", ""))
             providers = provider_search_by_id(
                 id = pid, 
                 group_id = state.get("group_id", ""),
                 subscriber_id = state.get("subscriber_id", ""),
-                asOfDate = state.get("asOfDate", ""),
+                asOfDate = "20251211" # state.get("asOfDate", ""), # commenetd for testing
                 )
-            # print("raw result : ", providers)
+            print("raw result : ", providers)
             # Now build the AIResponse JSON in the requried shape using providers
             grid_list: List[Dict[str, Any]] = []
             for p in providers:
@@ -1139,7 +1172,9 @@ def node_update_pcp(state: PCPState) -> PCPState:
     curr_pid = (state.get("active_provider_id") or "").strip()
     trsn = (state.get("termination_reason") or "").strip()
 
-    if not (meme_ck and grgr_ck and curr_pid and trsn):
+    print("meme_ck:", meme_ck, "grgr_ck:", grgr_ck, "curr_pid:", curr_pid, "trsn:", trsn)
+
+    if not (meme_ck and grgr_ck and trsn):
         state["ai_response"] = "Missing required member/termination details to update PCP."
         state["ai_response_type"] = "AURA"
         state["ai_response_code"] = 500
@@ -1150,17 +1185,35 @@ def node_update_pcp(state: PCPState) -> PCPState:
         return state
 
     # Dates
-    today = datetime.now()
-    tomorrow = today + timedelta(days=1)
-    term_dt = mmddyyyy(today)
-    add_eff_dt = mmddyyyy(tomorrow)
+    # today = datetime.now()
+    # tomorrow = today + timedelta(days=1)
+    # term_dt = mmddyyyy(today)
+    # add_eff_dt = mmddyyyy(tomorrow)
+
+    # print("today :", today)
+    # print("tomorrow :", tomorrow)
+    # print("term_dt :", term_dt)
+    # print("add_eff_dt :", add_eff_dt)
+
+    today_dt = datetime.now().date()
+    today_mmddyyyy = format_date_mmddyyyy(today_dt)
+    tomorrow_dt = today_dt + timedelta(days=1)
+    tommorrow_mmddyyyy = format_date_mmddyyyy(tomorrow_dt)
+    
+    print("today dt : ", today_dt)
+    print("today mmddyyyy: ", today_mmddyyyy)
+    print("tomorrow dt : ", tomorrow_dt)
+    print("tomorrow mmddyyyy: ", tommorrow_mmddyyyy)
 
     # Termination effective date must come from active PCP
     active_eff = (state.get("active_eff_dt") or "").strip()
-
+    print("active eff: ", active_eff)
+    prev_eff_mmddyyyy = format_date_mmddyyyy(active_eff) if active_eff else tommorrow_mmddyyyy
+    print("prev eff: ", prev_eff_mmddyyyy)
+    print("today dt : ", today_mmddyyyy)
     # Config values (not hardcoded)
-    pcp_type = getattr(settings, "PCP_TYPE", None) or getattr(settings, "pcp_type", None)
-    mctr_orsn = getattr(settings, "MCTR_ORSN", None) or getattr(settings, "mctr_orsn", None)
+    pcp_type = getattr(settings, "pcpType", None) or getattr(settings, "pcp_type", None)
+    mctr_orsn = getattr(settings, "mctrOrsn", None) or getattr(settings, "mctr_orsn", None)
 
     if not pcp_type or not mctr_orsn:
         state["ai_response"] = "PCP_TYPE / MCTR_ORSN missing from settings."
@@ -1173,22 +1226,33 @@ def node_update_pcp(state: PCPState) -> PCPState:
         return state
 
     try:
-        # 1) TERMINATE CURRENT PCP
-        term_req = make_change_family_broker_request(
-            grgr_ck=grgr_ck,
-            meme_ck=meme_ck,
-            pcp_type=pcp_type,
-            prpr_id=curr_pid,
-            eff_dt=active_eff,          # from active PCP
-            term_dt=term_dt,            # today
-            mctr_trsn=trsn,             # stored termination reason
-            mctr_orsn=mctr_orsn,         # from config
-        )
-        term_env = build_executeex_envelope(term_req)
-        term_resp = call_execute_ex(term_env)
-        err = extract_short_error(term_resp)
-        if err:
-            raise RuntimeError(f"Termination failed: {err}")
+        if curr_pid != "":
+            print("inside termination if")
+            # 1) TERMINATE CURRENT PCP
+            term_req = make_change_family_broker_request(
+                grgr_ck=grgr_ck,
+                meme_ck=meme_ck,
+                pcp_type=pcp_type,
+                prpr_id=curr_pid,
+                eff_dt_mmddyyyy=prev_eff_mmddyyyy,          # from active PCP
+                term_dt_mmddyyyy=today_mmddyyyy,            # today
+                mctr_trsn=trsn,             # stored termination reason
+                mctr_orsn=mctr_orsn,         # from config
+            )
+            print("term req : ", term_req)
+            term_env = build_executeex_envelope(term_req)
+            print("term_env : ", term_env)
+            # term_resp = call_execute_ex(term_env)
+            # print("response :", term_resp)
+            # err = extract_short_error(term_resp)
+            # if err:
+            #     raise RuntimeError(f"Termination failed: {err}")
+            try:
+                resp_term = call_execute_ex(term_env)
+                print("response terminate : ", resp_term)
+            except Exception as te:
+                short = extract_short_error(str(te))
+                raise RuntimeError(f"Terminate step failed: {short}") from te
 
         # 2) ADD NEW PCP
         add_req = make_change_family_broker_request(
@@ -1196,27 +1260,38 @@ def node_update_pcp(state: PCPState) -> PCPState:
             meme_ck=meme_ck,
             pcp_type=pcp_type,
             prpr_id=new_pid,
-            eff_dt=add_eff_dt,          # tomorrow
-            term_dt="",                 # empty
+            eff_dt_mmddyyyy=tommorrow_mmddyyyy,          # tomorrow
+            term_dt_mmddyyyy="",                 # empty
             mctr_trsn="",               # empty
             mctr_orsn="",               # empty
         )
+        print("add req : ", add_req)
         add_env = build_executeex_envelope(add_req)
-        add_resp = call_execute_ex(add_env)
-        err = extract_short_error(add_resp)
-        if err:
-            raise RuntimeError(f"Add PCP failed: {err}")
+        # add_resp = call_execute_ex(add_env)
+        # print("add response : ", add_resp)
+        # err = extract_short_error(add_resp)
+        # if err:
+        #     raise RuntimeError(f"Add PCP failed: {err}")
+        print("add_env : ", add_env)
+        try:
+            resp = call_execute_ex(add_env)
+            print("resp: ", resp)
+        except Exception as ae:
+            short = extract_short_error(str(ae))
+            raise RuntimeError(f"Assign step failed: {short}") from ae
 
         # 3) VERIFY
         verify = get_active_pcp(member_key=meme_ck, grgr_ck=grgr_ck)
         active = (verify.get("active") or {}) if isinstance(verify, dict) else {}
+        print("active : ", active)
         verified_pid = (
             active.get("provId")
             or active.get("providerId")
             or active.get("PCPProviderId")
         )
         verified_pid = str(verified_pid).strip() if verified_pid else ""
-
+        print("verified pid : ", verified_pid)
+        print("new pid : ", new_pid)
         if verified_pid != new_pid:
             raise RuntimeError("PCP update could not be verified. Please try again.")
 
@@ -1228,15 +1303,15 @@ def node_update_pcp(state: PCPState) -> PCPState:
         addr = _format_address_from_provider(snap) if snap else ""
 
         # Display effective date as MM/DD/YYYY
-        eff_disp = mmddyyyy_slash(tomorrow)
-
+        eff_disp = format_date_mmddyyyy(tomorrow_dt)
+        print("snap : ", snap, " name : ", name, " phone : ", phone, " addr : ", addr," eff disp : ", eff_disp)
         msg = (
-            "New PCP has assigned:\n\n"
-            f"Name: **{name}**.\n"
-            f"Address: **{addr}**.\n"
-            f"Phome Number: **{phone}**.\n"
-            f"Effective Date: **{eff_disp}**.\n\n"
-            "Please allow upto 7 calendar days to receive your new card.\n\n"
+            "New PCP has assigned:<br><br>"
+            f"Name: <b>{name}</b>.<br>"
+            f"Address: <b>{addr}</b>.<br>"
+            f"Phome Number: <b>{phone}</b>.<br>"
+            f"Effective Date: <b>{eff_disp}</b>.<br><br>"
+            "Please allow upto 7 calendar days to receive your new card.<br><br>"
             "Do you need further assistance?"
         )
 
@@ -1430,7 +1505,7 @@ def node_provider_interaction(state: PCPState) -> PCPState:
         # state["ai_response_code"] = 101
         # state["ai_response_type"] = "Dialog"
         # state["stage"] = "COMPLETED"
-        # state["last_folloup_action"] = "assign_pcp"
+        # state["last_followup_action"] = "assign_pcp"
         # return state
 
     # If other / not clear
@@ -1444,7 +1519,7 @@ def node_provider_interaction(state: PCPState) -> PCPState:
     state["ai_response_code"] = 110
     state["ai_response_type"] = "Dialog"
     state["stage"] = "PROVIDER_FOLLOWUP_RESPONSE"
-    state["last_folloup_action"] = "other"
+    state["last_followup_action"] = "other"
     # state["csr_query"] = ""  # so next call will re-interrupt
     return state
 
