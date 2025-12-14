@@ -1,3 +1,6 @@
-METRICS_XLSX_PATH = Path(getattr(settings, "METRICS_XLSX_PATH", str(METRICS_DIR / "api_metrics.xlsx")))
-METRICS_MASTER_CSV = Path(getattr(settings, "METRICS_MASTER_CSV", str(METRICS_DIR / "api_metrics_master.csv")))
-METRICS_QUEUE_CSV = Path(getattr(settings, "METRICS_QUEUE_CSV", str(METRICS_DIR / "api_metrics_queue.csv")))
+    if isinstance(content, str):
+        out_text = content.strip()
+        if telemetry is not None:
+            telemetry["llm_completion_tokens"] = telemetry.get("llm_completion_tokens", 0) + estimate_tokens(out_text)
+            telemetry["llm_latency_ms"] = telemetry.get("llm_latency_ms", 0.0) + ((perf_counter() - t0) * 1000.0)
+        return out_text
