@@ -1,67 +1,20 @@
-def llm_extract_provider_query_from_assign_text(user_text: str) -> Dict[str, Any]:
-    """
-    Extract provider search query from a free-form 'assign ... as pcp' message.
+def _set_call_source(state: PCPState, call_type: str, call_name: str) -> None:
+    state["call_type"] = call_type
+    state["call_name"] = call_name
 
-    Returns ONLY JSON:
-    {
-      "search_type": "id" | "name_city_state" | "zip_only" | "unknown",
-      "provider_id": string | null,
-      "zip": string | null,
-      "name": string | null,
-      "city": string | null,
-      "state": string | null
-    }
-    """
-    system = (
-        "You extract provider-identifying info from a user request that intends to assign a PCP.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{\n"
-        '  "search_type": "id" | "name_city_state" | "zip_only" | "unknown",\n'
-        '  "provider_id": string | null,\n'
-        '  "zip": string | null,\n'
-        '  "name": string | null,\n'
-        '  "city": string | null,\n'
-        '  "state": string | null\n'
-        "}\n"
-        "Rules:\n"
-        "- If there is an 8-digit provider id anywhere in the text, use search_type='id' and set provider_id.\n"
-        "- Else if there is a provider name anywhere in the text (even if city/state/zip are NOT present), "
-        "use search_type='name_city_state' and set name. city/state/zip may be null.\n"
-        "- Else if there is a 5-digit ZIP and no provider id and no name, use search_type='zip_only' and set zip.\n"
-        "- Ignore filler words like 'please', 'assign', 'as pcp', etc.\n"
-        "Return JSON only."
-    )
+def mark_llm(state: PCPState) -> None:
+    # configurable label (not hardcoded)
+    llm_label = getattr(settings, "CALL_SOURCE_LLM_LABEL", "LLM")
+    _set_call_source(state, "LLM", llm_label)
 
-    raw = call_horizon(system, user_text).strip()
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        i = raw.find("{")
-        if i != -1:
-            raw = raw[i:]
-    try:
-        data = json.loads(raw)
-        st = (data.get("search_type") or "unknown").strip()
-        if st not in ("id", "name_city_state", "zip_only"):
-            st = "unknown"
-        return {
-            "search_type": st,
-            "provider_id": data.get("provider_id"),
-            "zip": data.get("zip"),
-            "name": data.get("name"),
-            "city": data.get("city"),
-            "state": data.get("state"),
-        }
-    except Exception:
-        logger.warning("Failed to parse assign-text provider JSON from LLM: %s", raw)
-        return {
-            "search_type": "unknown",
-            "provider_id": None,
-            "zip": None,
-            "name": None,
-            "city": None,
-            "state": None,
-        }
+def mark_api(state: PCPState, fn_or_name: Any) -> None:
+    # use function name when possible (no hardcoded API names)
+    name = getattr(fn_or_name, "__name__", None) or str(fn_or_name)
+    _set_call_source(state, "API", name)
 
+def mark_system(state: PCPState) -> None:
+    sys_label = getattr(settings, "CALL_SOURCE_SYSTEM_LABEL", "SYSTEM")
+    _set_call_source(state, "SYSTEM", sys_label)
 
-##############################################3
+#################################################################################
 
